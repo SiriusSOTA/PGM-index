@@ -18,6 +18,7 @@
 #include "morton_nd.hpp"
 #include "piecewise_linear_model.hpp"
 #include "pgm_index.hpp"
+#include "pgm_index_eytzinger.hpp"
 #include "sdsl.hpp"
 
 #include <fcntl.h>
@@ -57,6 +58,9 @@ namespace pgm {
  */
 template<typename K, size_t Epsilon, typename Floating = float>
 using OneLevelPGMIndex = PGMIndex<K, Epsilon, 0, Floating>;
+
+template<typename K, size_t Epsilon, typename Floating = float>
+using OneLevelEytzingerPGMIndex = PGMIndexEytzinger<K, Epsilon, Floating>;
 
 /**
  * A variant of @ref PGMIndex that uses compression on the segments to reduce the space of the index.
@@ -313,25 +317,24 @@ struct CompressedPGMIndex<K, Epsilon, EpsilonRecursive, Floating>::CompressedLev
         keys.emplace_back(std::numeric_limits<K>::max());
 
         // Compress and store intercepts
-        sdsl::bit_vector intercept_bv(prev_level_size - intercept_offset + 1);
-        intercept_bv[prev_level_size - intercept_offset] = true;
-        for (auto it = first_intercept; it != last_intercept; ++it) {
-            auto idx = std::min<int64_t>(prev_level_size - 1, *it) - intercept_offset;
-            intercept_bv[idx] = true;
-        }
+        auto max_intercept = prev_level_size - intercept_offset + 2;
+        auto intercepts_count = std::distance(first_intercept, last_intercept) + need_extra_segment + 1;
+        sdsl::sd_vector_builder builder(max_intercept, intercepts_count);
+        builder.set(0);
+        for (auto it = first_intercept + 1; it != last_intercept; ++it)
+            builder.set(std::clamp<int64_t>(*it, *(it - 1) + 1, prev_level_size - 1) - intercept_offset);
         if (need_extra_segment)
-            intercept_bv[prev_level_size + 1 - intercept_offset] = true;
-        compressed_intercepts = sdsl::sd_vector<>(intercept_bv);
+            builder.set(max_intercept - 2);
+        builder.set(max_intercept - 1);
+        compressed_intercepts = sdsl::sd_vector<>(builder);
         sdsl::util::init_support(sel1, &compressed_intercepts);
 
         // Compress and store slopes_map
-        size_t i = 0;
-        size_t map_size = std::distance(first_slope, last_slope) + need_extra_segment;
+        auto map_size = std::distance(first_slope, last_slope) + need_extra_segment;
         slopes_map = sdsl::int_vector<>(map_size, 0, sdsl::bits::hi(slopes_table.size() - 1) + 1);
-        for (auto it = first_slope; it != last_slope; ++it)
-            slopes_map[i++] = *it;
+        std::copy(first_slope, last_slope, slopes_map.begin());
         if (need_extra_segment)
-            slopes_map[slopes_map.size() - 1] = slopes_table[*std::prev(last_slope)];
+            slopes_map.back() = slopes_table[*std::prev(last_slope)];
     }
 
     inline size_t operator()(const std::vector<Floating> &slopes, size_t i, K k) const {
@@ -370,13 +373,13 @@ struct CompressedPGMIndex<K, Epsilon, EpsilonRecursive, Floating>::CompressedLev
  * @tparam TopLevelBitSize the bit-size of the cells in the top-level table, must be either 0 or a power of two
  * @tparam Floating the floating-point type to use for slopes
  */
-template<typename K, size_t Epsilon = 64, uint8_t TopLevelBitSize = 32, typename Floating = float>
+template<typename K, size_t Epsilon = 64, uint8_t TopLevelBitSize = 32, typename Floating = float, typename PGMType = PGMIndex<K, Epsilon, 0, Floating>>
 class BucketingPGMIndex {
 protected:
     static_assert(Epsilon > 0);
     static_assert(TopLevelBitSize == 0 || (TopLevelBitSize & (TopLevelBitSize - 1u)) == 0);
 
-    using Segment = typename PGMIndex<K, Epsilon, 0, Floating>::Segment;
+    using Segment = typename PGMType::Segment;
 
     size_t n;                                     ///< The number of elements this index was built on.
     K first_key;                                  ///< The smallest element.
@@ -396,7 +399,8 @@ protected:
             top_level = sdsl::int_vector<TopLevelBitSize>(top_level_size, segments.size(), TopLevelBitSize);
         }
 
-        step = CEIL_INT_DIV(*std::prev(last), top_level_size);
+        step = std::max<K>(CEIL_INT_DIV(*std::prev(last), top_level_size), 1);
+
         for (auto i = 0ull, k = 1ull; i < top_level_size - 1; ++i) {
             while (k < segments.size() && (segments[k].key - first_key) < K(i + 1) * step)
                 ++k;
@@ -513,6 +517,9 @@ public:
         return segments.size() * sizeof(Segment) + top_level.size() * top_level.width() / CHAR_BIT;
     }
 };
+
+template<typename K, size_t Epsilon = 64, uint8_t TopLevelBitSize = 32, typename Floating = float>
+using BucketingPGMIndexEytzinger = BucketingPGMIndex<K, Epsilon, TopLevelBitSize, Floating, PGMIndexEytzinger<K, Epsilon, Floating>>;
 
 /**
  * A variant of @ref OneLevelPGMIndex that builds a top-level succinct structure to speed up the search on the
